@@ -7,11 +7,12 @@ from werkzeug.wsgi import SharedDataMiddleware
 from jinja2.loaders import FileSystemLoader, PackageLoader
 from flask import Flask
 
-from PySide import QtGui
-from PySide.QtWebKit import QWebView, QWebSettings
-from PySide.QtCore import QUrl, QByteArray
+from PySide import QtGui, QtNetwork
+from PySide.QtWebKit import QWebView, QWebSettings, QWebPage
+from PySide.QtCore import QUrl, QByteArray, QObject, SIGNAL, SLOT
 
 import pkgutil
+import os
 
 
 # See http://stackoverflow.com/questions/6690639/how-to-configure-static-serving-in-twisted-with-django
@@ -26,16 +27,30 @@ class SharedRoot(resource.Resource):
 
     def render(self, request):
         return self.WSGI.render(request)
-    
-    
+
+
+class CustomWebPage(QWebPage):
+    def customPrintRequested(self, webFrame):
+        self.printer = QtGui.QPrinter()
+        dialog = QtGui.QPrintDialog(self.printer)
+        dialog.setWindowTitle("Print Document")
+        if dialog.exec_() != QtGui.QDialog.Accepted:
+            return
+        webFrame.print_(self.printer)
+
+    def __init__(self, parent = None):
+        QWebPage.__init__(self, parent)
+        self.connect(self, SIGNAL("printRequested(QWebFrame *)"), self.customPrintRequested)
+
+
 class Browser(QWebView):
     "Web browser"
     def __init__(self, url, title=None, geometry=None, icon=None):
         super(Browser, self).__init__()
-        
+
         self.setGeometry(*geometry)
         self.setWindowTitle(title)
-        
+
         if icon:
             pixmap = QtGui.QPixmap()
             if type(icon) == tuple:  # package, not filepath
@@ -46,11 +61,31 @@ class Browser(QWebView):
             pixmap.loadFromData(QByteArray(img_data))
             self.setWindowIcon(QtGui.QIcon(pixmap))
 
+        self.manager = QtNetwork.QNetworkAccessManager()
+        self.manager.finished.connect(self.finished)
+
+        self.setPage(CustomWebPage())
+        self.page().setForwardUnsupportedContent(True)
+        self.page().unsupportedContent.connect(self.download)
+
         self.load(QUrl(url))
-        
+
     def closeEvent(self, event):
         event.accept()
         reactor.stop()
+
+    def download(self, reply):
+        self.request = QtNetwork.QNetworkRequest(reply.url())
+        self.reply = self.manager.get(self.request)
+
+    def finished(self):
+        path = os.path.expanduser(os.path.join('~', unicode(self.reply.url().path()).split('/')[-1]))
+        destination = QtGui.QFileDialog.getSaveFileName(self, "Save", path)
+        if destination:
+            filename = destination[0]
+            with open(filename, 'wb') as f:
+                f.write(str(self.reply.readAll()))
+                f.close()
 
 
 class Config(object):
@@ -66,7 +101,7 @@ class Config(object):
     ICON_RESOURCE = None
     WINDOW_TITLE = "Scandium Browser"
     WINDOW_GEOMETRY = (100, 100, 800, 500)
-    
+
     def update(self, settings_module):
         for setting in dir(settings_module):
             if setting == setting.upper():
@@ -79,37 +114,37 @@ class Harness():
     """
     def __init__(self):
         self.conf = Config()
-        
+
     def start(self):
         root = SharedRoot()
         root.WSGI = WSGIResource(reactor, reactor.getThreadPool(), self.app)
         self.webserver = server.Site(root)
-        
+
         reactor.listenTCP(self.conf.HTTP_PORT, self.webserver)
         reactor.callLater(0, self.browser.show)
         reactor.run()
-    
+
     @property
     def app(self):
         if not hasattr(self, '_app'):
             self._app = self._create_app()
         return self._app
-    
+
     @property
     def browser(self):
         if not hasattr(self, '_browser'):
             self._browser = self._create_browser()
         return self._browser
-    
+
     def _create_app(self):
         app = Flask(__name__)
         app.debug = self.conf.FLASK_DEBUG
-        
+
         if not self.conf.STATIC_RESOURCE:
             raise Exception('STATIC_RESOURCE setting not configured.')
         if not self.conf.TEMPLATE_RESOURCE:
             raise Exception('TEMPLATE_RESOURCE setting not configured.')
-        
+
         app.wsgi_app = SharedDataMiddleware(app.wsgi_app, {
             '/': self.conf.STATIC_RESOURCE
         })
@@ -120,13 +155,13 @@ class Harness():
         if self.conf.ALLOW_DEFERREDS:
             self._enable_deferreds(app)
         return app
-    
+
     def _create_browser(self):
         browser = Browser('http://localhost:%d/' % self.conf.HTTP_PORT, \
                           icon=self.conf.ICON_RESOURCE,
                           title=self.conf.WINDOW_TITLE,
                           geometry=self.conf.WINDOW_GEOMETRY)
-        
+
         devextras = QWebSettings.WebAttribute.DeveloperExtrasEnabled
         browser.settings().setAttribute(devextras, self.conf.DEBUG)
         return browser
@@ -134,7 +169,7 @@ class Harness():
     def _enable_deferreds(self, app):
             import Queue
             import functools
-        
+
             #From the comments here:
             #http://www.saltycrane.com/blog/2008/10/cant-block-deferred-twisted
             def block_on(d):
@@ -146,12 +181,12 @@ class Harness():
                     ret.raiseException()
                 else:
                     return ret
-            
+
             def routeMaybeDeferred(rule, **options):
                 """
                 A routing method that allows the view function to return a
                 deferred, and if so blocks for it to complete.
-                
+
                 This is a hack: we should really be using something like
                 https://github.com/twisted/klein, but klein won't work with the
                 Qt reactor.
